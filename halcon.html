@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Halcón – Seguimiento visual</title>
+<style>
+:root{--bg:#eef1f4;--fg:#14202b;--card:#fff;--line:#c9d2db;--ok:#1f9d55;--mid:#d98e04;--bad:#d33a3a;--btn:#14202b;--btnfg:#fff;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#10171e;--fg:#e8eef3;--card:#1a232c;--line:#2d3a46;--btn:#e8eef3;--btnfg:#10171e}}
+:root[data-theme="dark"]{--bg:#10171e;--fg:#e8eef3;--card:#1a232c;--line:#2d3a46;--btn:#e8eef3;--btnfg:#10171e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:"Trebuchet MS",system-ui,sans-serif;line-height:1.45}
+main{max-width:640px;margin:0 auto;padding:14px}
+h1{font-size:1.25rem;margin:0 0 2px}
+.sub{margin:0 0 12px;font-size:.9rem;opacity:.8}
+#stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:10px;overflow:hidden;touch-action:none}
+video,canvas{position:absolute;inset:0;width:100%;height:100%}
+video{object-fit:fill}
+#empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;text-align:center;padding:20px;font-size:.95rem}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+button,label.btn{background:var(--btn);color:var(--btnfg);border:0;border-radius:8px;padding:10px 14px;font:inherit;font-size:.95rem;cursor:pointer}
+button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}
+label.btn{position:relative;overflow:hidden}
+input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+#status{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:.95rem}
+#status b{display:inline-block;min-width:5.5em}
+#bar{height:8px;border-radius:4px;background:var(--line);margin-top:8px;overflow:hidden}
+#fill{height:100%;width:0;background:var(--ok);transition:width .15s,background .15s}
+.note{font-size:.82rem;opacity:.75;margin-top:10px}
+</style>
+</head>
+<body>
+<main>
+<h1>Halcón: seguimiento visual</h1>
+<p class="sub">Dibuja un cuadro sobre el carro y la app intentará mantenerlo a la vista.</p>
+
+<div id="stage">
+  <video id="v" playsinline muted></video>
+  <canvas id="c"></canvas>
+  <div id="empty">Activa la cámara o carga un video de prueba.</div>
+</div>
+
+<div class="row">
+  <button id="cam">Activar cámara</button>
+  <label class="btn">Grabar video<input id="rec" type="file" accept="video/*" capture="environment"></label>
+  <label class="btn">Elegir video<input id="file" type="file" accept="video/*"></label>
+  <button id="reset" class="alt">Soltar objetivo</button>
+</div>
+
+<div id="status">
+  <div><b id="st">Sin objetivo</b> <span id="msg">Arrastra el dedo sobre el carro para marcarlo.</span></div>
+  <div id="bar"><div id="fill"></div></div>
+</div>
+
+<p class="note">Todo se procesa en tu teléfono. No se guarda ninguna imagen. Haz pruebas con un carro cuyo dueño sepa lo que haces y nunca mientras manejas.</p>
+</main>
+
+<script>
+const v=document.getElementById('v'),c=document.getElementById('c'),ctx=c.getContext('2d');
+const stage=document.getElementById('stage'),empty=document.getElementById('empty');
+const st=document.getElementById('st'),msg=document.getElementById('msg'),fill=document.getElementById('fill');
+const W=160;let H=120;
+const w=document.createElement('canvas'),wx=w.getContext('2d',{willReadFrequently:true});
+const G=16; // la huella del objetivo es una cuadrícula de 16x16 puntos de color
+let T=null;   // {cx,cy,bw,bh,tpl}
+let trail=[],lost=0,frame=0,conf=0,state='none',drag=null,running=false,img=null;
+
+function fit(){c.width=stage.clientWidth;c.height=stage.clientHeight}
+window.addEventListener('resize',fit);fit();
+
+function setSize(){
+  const r=(v.videoWidth||4)/(v.videoHeight||3);
+  stage.style.aspectRatio=r;H=Math.round(W/r);w.width=W;w.height=H;fit();
+}
+function start(){
+  setSize();empty.style.display='none';
+  v.play().catch(()=>{});
+  if(!running){running=true;loop()}
+}
+document.getElementById('cam').onclick=async()=>{
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    v.srcObject=s;v.onloadedmetadata=start;
+  }catch(e){
+    empty.style.display='flex';
+    empty.textContent='La cámara no se pudo abrir aquí ('+(e&&e.name||'error')+'). Usa "Grabar video" o "Elegir video".';
+  }
+};
+['file','rec'].forEach(id=>document.getElementById(id).onchange=e=>{
+  const f=e.target.files[0];if(!f)return;
+  v.srcObject=null;v.src=URL.createObjectURL(f);v.loop=true;v.onloadedmetadata=start;v.load();
+});
+document.getElementById('reset').onclick=()=>{T=null;trail=[];state='none';lost=0;ui()};
+
+// --- dibujar el cuadro del objetivo con el dedo ---
+function pos(e){const r=c.getBoundingClientRect();return{x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height}}
+c.addEventListener('pointerdown',e=>{if(!running)return;c.setPointerCapture(e.pointerId);const p=pos(e);drag={a:p,b:p}});
+c.addEventListener('pointermove',e=>{if(drag)drag.b=pos(e)});
+c.addEventListener('pointerup',()=>{
+  if(!drag)return;
+  const x0=Math.min(drag.a.x,drag.b.x)*W,x1=Math.max(drag.a.x,drag.b.x)*W;
+  const y0=Math.min(drag.a.y,drag.b.y)*H,y1=Math.max(drag.a.y,drag.b.y)*H;
+  drag=null;
+  if(x1-x0<8||y1-y0<8){msg.textContent='Cuadro muy pequeño. Dibuja uno más grande sobre el carro.';return}
+  grab();
+  const bw=x1-x0,bh=y1-y0,cx=(x0+x1)/2,cy=(y0+y1)/2;
+  T={cx,cy,bw,bh,tpl:sample(cx,cy,bw,bh)};trail=[];lost=0;conf=1;state='ok';
+});
+
+// --- visión: compara la huella de color en distintas posiciones ---
+function grab(){wx.drawImage(v,0,0,W,H);img=wx.getImageData(0,0,W,H).data}
+function sample(cx,cy,bw,bh){
+  const out=new Uint8Array(G*G*3);let k=0;
+  for(let j=0;j<G;j++)for(let i=0;i<G;i++){
+    const x=Math.min(W-1,Math.max(0,Math.round(cx-bw/2+(i+.5)*bw/G)));
+    const y=Math.min(H-1,Math.max(0,Math.round(cy-bh/2+(j+.5)*bh/G)));
+    const p=(y*W+x)*4;out[k++]=img[p];out[k++]=img[p+1];out[k++]=img[p+2];
+  }
+  return out;
+}
+function cost(cx,cy,bw,bh,tpl){
+  let s=0,k=0;
+  for(let j=0;j<G;j++)for(let i=0;i<G;i++){
+    const x=Math.min(W-1,Math.max(0,Math.round(cx-bw/2+(i+.5)*bw/G)));
+    const y=Math.min(H-1,Math.max(0,Math.round(cy-bh/2+(j+.5)*bh/G)));
+    const p=(y*W+x)*4;
+    s+=Math.abs(img[p]-tpl[k])+Math.abs(img[p+1]-tpl[k+1])+Math.abs(img[p+2]-tpl[k+2]);k+=3;
+  }
+  return s/(G*G*3);
+}
+function search(cx0,cy0,R,step){
+  let best={s:1e9,x:cx0,y:cy0},cands=[];
+  for(let y=cy0-R;y<=cy0+R;y+=step)for(let x=cx0-R;x<=cx0+R;x+=step){
+    if(x<0||y<0||x>=W||y>=H)continue;
+    const s=cost(x,y,T.bw,T.bh,T.tpl);cands.push({s,x,y});
+    if(s<best.s)best={s,x,y};
+  }
+  // segundo mejor candidato lejos del primero: sirve para detectar "otro carro parecido"
+  let second=1e9;
+  for(const q of cands){if(Math.hypot(q.x-best.x,q.y-best.y)>T.bw*.7&&q.s<second)second=q.s}
+  return{best,second};
+}
+function track(){
+  grab();
+  const wide=state==='lost';
+  let res;
+  if(wide){ if(frame%4===0)res=search(W/2,H/2,Math.max(W,H),5); else return }
+  else res=search(Math.round(T.cx),Math.round(T.cy),Math.round(Math.max(T.bw,T.bh)*.6)+4,2);
+  const s=res.best.s;
+  conf=Math.max(0,Math.min(1,1-s/70));
+  if(conf<.45){
+    lost++;if(lost>6)state='lost';
+    if(state!=='lost'){state='low'}
+    return;
+  }
+  lost=0;
+  T.cx=res.best.x;T.cy=res.best.y;
+  trail.push([T.cx,T.cy]);if(trail.length>40)trail.shift();
+  const amb=res.second<1e9&&res.second<s*1.25+6;
+  state=amb?'doubt':(conf>.7?'ok':'mid');
+  if(conf>.8&&!amb){ // la huella se adapta despacio a cambios de luz
+    const n=sample(T.cx,T.cy,T.bw,T.bh);
+    for(let i=0;i<n.length;i++)T.tpl[i]=T.tpl[i]*.9+n[i]*.1;
+  }
+}
+
+// --- dibujo e interfaz ---
+const COL={ok:'#1f9d55',mid:'#e0a000',doubt:'#e0a000',low:'#d33a3a',lost:'#d33a3a'};
+const TXT={
+  ok:['Seguro','Objetivo localizado.'],
+  mid:['Probable','Lo veo, pero con menos certeza.'],
+  doubt:['Dudoso','Hay otra zona parecida. No confirmo que sea el mismo carro.'],
+  low:['Perdiendo','Lo perdí de vista un instante.'],
+  lost:['Perdido','Seguimiento perdido. Busco de nuevo en toda la imagen.'],
+  none:['Sin objetivo','Arrastra el dedo sobre el carro para marcarlo.']
+};
+function ui(){
+  const t=TXT[state];st.textContent=t[0];msg.textContent=t[1];
+  fill.style.width=(state==='none'?0:Math.round(conf*100))+'%';
+  fill.style.background=COL[state]||'#999';
+}
+function draw(){
+  ctx.clearRect(0,0,c.width,c.height);
+  const sx=c.width/W,sy=c.height/H;
+  if(T&&state!=='lost'){
+    const col=COL[state];
+    if(trail.length>1){ctx.strokeStyle=col;ctx.globalAlpha=.7;ctx.lineWidth=2;ctx.beginPath();
+      trail.forEach((p,i)=>i?ctx.lineTo(p[0]*sx,p[1]*sy):ctx.moveTo(p[0]*sx,p[1]*sy));ctx.stroke();ctx.globalAlpha=1}
+    ctx.strokeStyle=col;ctx.lineWidth=3;
+    if(state==='low'||state==='doubt')ctx.setLineDash([8,6]);
+    ctx.strokeRect((T.cx-T.bw/2)*sx,(T.cy-T.bh/2)*sy,T.bw*sx,T.bh*sy);ctx.setLineDash([]);
+    ctx.fillStyle=col;ctx.font='bold 13px sans-serif';
+    ctx.fillText(Math.round(conf*100)+'%',(T.cx-T.bw/2)*sx+2,(T.cy-T.bh/2)*sy-5);
+  }
+  if(drag){
+    ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.setLineDash([5,4]);
+    ctx.strokeRect(drag.a.x*c.width,drag.a.y*c.height,(drag.b.x-drag.a.x)*c.width,(drag.b.y-drag.a.y)*c.height);ctx.setLineDash([]);
+  }
+}
+function loop(){
+  frame++;
+  if(v.readyState>=2){ if(T&&!drag)track(); if(frame%3===0)ui(); draw() }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
